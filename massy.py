@@ -11,7 +11,7 @@ import emoji
 class TranscriptionApp:
     def __init__(self, master):
         self.master = master
-        self.master.title("MP3 Transcription App")
+        self.master.title("MASSY - MP3 Transcription App")
         self.master.geometry("800x600")
 
         self.api_key = tk.StringVar()
@@ -27,6 +27,7 @@ class TranscriptionApp:
         self.stop_event = threading.Event()
         self.total_files = 0
         self.completed_files = 0
+        self.processed_parts = {}
 
     def create_widgets(self):
         # API Key
@@ -99,10 +100,6 @@ class TranscriptionApp:
         progress_bar['value'] = progress
         status_label.config(text=status)
         
-        if status == "Completed" and progress == 100:
-            self.completed_files += 1
-        
-        self.update_overall_progress()
         self.master.update_idletasks()
 
     def update_overall_progress(self):
@@ -194,23 +191,24 @@ class TranscriptionApp:
         part1.export(part1_path, format="mp3")
         part2.export(part2_path, format="mp3")
 
-        self.update_file_progress(file_name, "Queued", 75)
-        self.queue_file(part1_path)
-        self.queue_file(part2_path)
+        self.update_file_progress(file_name, "Processing parts", 75)
+        self.queue_file(part1_path, original_file=file_name)
+        self.queue_file(part2_path, original_file=file_name)
 
-    def queue_file(self, file_path):
+    def queue_file(self, file_path, original_file=None):
         file_name = os.path.basename(file_path)
-        self.transcription_queue.put(file_path)
+        self.transcription_queue.put((file_path, original_file))
         self.update_file_progress(file_name, "Queued", 0)
 
     def process_queue(self, client):
         while not self.transcription_queue.empty() and not self.stop_event.is_set():
-            file_path = self.transcription_queue.get()
-            self.transcribe_file(client, file_path)
+            file_path, original_file = self.transcription_queue.get()
+            self.transcribe_file(client, file_path, original_file)
+        
         self.update_overall_progress()
         self.show_summary()
 
-    def transcribe_file(self, client, file_path):
+    def transcribe_file(self, client, file_path, original_file=None):
         file_name = os.path.basename(file_path)
         try:
             self.update_file_progress(file_name, "Uploading", 25)
@@ -227,10 +225,25 @@ class TranscriptionApp:
             with open(transcript_path, "w", encoding="utf-8") as f:
                 f.write(transcript.text)
 
-            self.update_file_progress(file_name, "Completed", 100)
+            if not original_file:
+                self.update_file_progress(file_name, "Completed", 100)
+                self.completed_files += 1
+            else:
+                if original_file not in self.processed_parts:
+                    self.processed_parts[original_file] = 1
+                else:
+                    self.processed_parts[original_file] += 1
+                
+                if self.processed_parts[original_file] == 2:  # Both parts processed
+                    self.update_file_progress(original_file, "Completed", 100)
+                    self.completed_files += 1
+                else:
+                    self.update_file_progress(original_file, f"Part {self.processed_parts[original_file]}/2 done", 75 + (self.processed_parts[original_file] * 12.5))
 
         except Exception as e:
             self.update_file_progress(file_name, f"Failed: {str(e)}", 100)
+            if original_file:
+                self.update_file_progress(original_file, f"Failed: {str(e)}", 100)
 
     def get_transcript_path(self, file_path):
         base_name = os.path.splitext(os.path.basename(file_path))[0]
