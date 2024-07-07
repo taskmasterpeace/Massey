@@ -1,268 +1,362 @@
-import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from openai import OpenAI
+import os
 import threading
-import queue
+from openai import OpenAI
+import json
 from pydub import AudioSegment
-import time
-import emoji
-
+import math
+import datetime
+import re
 class TranscriptionApp:
     def __init__(self, master):
         self.master = master
-        self.master.title("MASSY - MP3 Transcription App")
-        self.master.geometry("800x600")
-
-        self.api_key = tk.StringVar()
-        self.folder_path = tk.StringVar()
-        self.overall_progress_var = tk.DoubleVar()
-        self.status_var = tk.StringVar()
-        self.status_var.set("Ready 🔍")
-        self.only_large_files = tk.BooleanVar()
+        self.master.title("MASSY - MP3 to Text Transcription")
+        self.master.geometry("1000x600")
 
         self.create_widgets()
-        self.file_progress = {}
-        self.transcription_queue = queue.Queue()
+
+        self.client = None
         self.stop_event = threading.Event()
-        self.total_files = 0
+        self.file_progress = {}
         self.completed_files = 0
-        self.processed_parts = {}
+        self.total_files = 0
+        self.queued_files = []
+        self.processed_files = []
+        self.skipped_files = []
 
     def create_widgets(self):
-        # API Key
-        tk.Label(self.master, text="OpenAI API Key:").pack(pady=5)
-        tk.Entry(self.master, textvariable=self.api_key, show="*", width=50).pack()
+        # API Key Entry
+        tk.Label(self.master, text="OpenAI API Key:").pack()
+        self.api_key_entry = tk.Entry(self.master, width=50, show="*")
+        self.api_key_entry.pack()
 
         # Folder Selection
-        folder_frame = tk.Frame(self.master)
-        folder_frame.pack(pady=10)
-        tk.Label(folder_frame, text="Select Folder:").pack(side=tk.LEFT)
-        tk.Entry(folder_frame, textvariable=self.folder_path, width=40).pack(side=tk.LEFT, padx=5)
-        tk.Button(folder_frame, text="Browse", command=self.select_folder).pack(side=tk.LEFT)
+        tk.Button(self.master, text="Select MP3 Folder", command=self.select_folder).pack(pady=10)
+        self.folder_path_var = tk.StringVar()
+        tk.Label(self.master, textvariable=self.folder_path_var).pack()
 
-        # Checkbox for large files only
-        tk.Checkbutton(self.master, text="Only transcribe files > 25MB", variable=self.only_large_files).pack()
+        # Output Format Selection
+        self.output_format_var = tk.StringVar(value="both")
+        tk.Label(self.master, text="Output Format:").pack()
+        tk.Radiobutton(self.master, text="SRT", variable=self.output_format_var, value="srt").pack()
+        tk.Radiobutton(self.master, text="Text", variable=self.output_format_var, value="text").pack()
+        tk.Radiobutton(self.master, text="Both", variable=self.output_format_var, value="both").pack()
 
         # Transcribe Button
-        tk.Button(self.master, text="Transcribe", command=self.start_transcription).pack(pady=10)
+        self.transcribe_button = tk.Button(self.master, text="Transcribe", command=self.start_transcription)
+        self.transcribe_button.pack(pady=10)
+
+        # Stop Button
+        self.stop_button = tk.Button(self.master, text="Stop", command=self.stop_transcription, state=tk.DISABLED)
+        self.stop_button.pack(pady=5)
 
         # Overall Progress Bar
-        tk.Label(self.master, text="Overall Progress:").pack()
-        self.overall_progress_bar = ttk.Progressbar(self.master, variable=self.overall_progress_var, maximum=100, length=700)
-        self.overall_progress_bar.pack(pady=5)
+        self.overall_progress = ttk.Progressbar(self.master, length=900, mode='determinate')
+        self.overall_progress.pack(pady=10)
 
-        # Status Label
-        self.status_label = tk.Label(self.master, textvariable=self.status_var, wraplength=700, font=("Segoe UI Emoji", 10))
-        self.status_label.pack(pady=5)
+        # Progress Display
+        self.progress_frame = tk.Frame(self.master)
+        self.progress_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Individual File Progress Frame
-        self.file_progress_frame = tk.Frame(self.master)
-        self.file_progress_frame.pack(pady=10, fill=tk.BOTH, expand=True)
-
-        # Scrollable Frame for File Progress
-        self.canvas = tk.Canvas(self.file_progress_frame)
-        self.scrollbar = ttk.Scrollbar(self.file_progress_frame, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.progress_canvas = tk.Canvas(self.progress_frame)
+        self.scrollbar_y = ttk.Scrollbar(self.progress_frame, orient="vertical", command=self.progress_canvas.yview)
+        self.scrollbar_x = ttk.Scrollbar(self.progress_frame, orient="horizontal", command=self.progress_canvas.xview)
+        self.scrollable_frame = tk.Frame(self.progress_canvas)
 
         self.scrollable_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
+            lambda e: self.progress_canvas.configure(
+                scrollregion=self.progress_canvas.bbox("all")
             )
         )
 
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.progress_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.progress_canvas.configure(yscrollcommand=self.scrollbar_y.set, xscrollcommand=self.scrollbar_x.set)
 
-        self.file_progress_frame.pack(fill="both", expand=True)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        self.progress_canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar_y.pack(side="right", fill="y")
+        self.scrollbar_x.pack(side="bottom", fill="x")
 
-    def update_status(self, message, emoji_code):
-        emoji_message = f"{emoji.emojize(emoji_code)} {message}"
-        self.status_var.set(emoji_message)
-        self.master.update_idletasks()
-
-    def update_file_progress(self, file_name, status, progress):
-        if file_name not in self.file_progress:
-            frame = tk.Frame(self.scrollable_frame)
-            frame.pack(fill=tk.X, padx=5, pady=2)
-            label = tk.Label(frame, text=file_name, width=30, anchor='w')
-            label.pack(side=tk.LEFT)
-            progress_bar = ttk.Progressbar(frame, length=200, maximum=100)
-            progress_bar.pack(side=tk.LEFT, padx=5)
-            status_label = tk.Label(frame, text="", width=20)
-            status_label.pack(side=tk.LEFT)
-            self.file_progress[file_name] = (frame, progress_bar, status_label)
-        
-        _, progress_bar, status_label = self.file_progress[file_name]
-        progress_bar['value'] = progress
-        status_label.config(text=status)
-        
-        self.master.update_idletasks()
-
-    def update_overall_progress(self):
-        if self.total_files > 0:
-            progress = (self.completed_files / self.total_files) * 100
-            self.overall_progress_var.set(progress)
-            if self.completed_files == self.total_files:
-                self.update_status("Transcription complete", ":party_popper:")
-            else:
-                self.update_status(f"Processing files... ({self.completed_files}/{self.total_files})", ":gear:")
+    def select_folder(self):
+        folder_path = filedialog.askdirectory()
+        if folder_path:
+            self.folder_path_var.set(folder_path)
 
     def start_transcription(self):
-        self.stop_event.clear()
-        threading.Thread(target=self.pre_check_and_transcribe, daemon=True).start()
-
-    def pre_check_and_transcribe(self):
-        api_key = self.api_key.get()
-        folder_path = self.folder_path.get()
+        api_key = self.api_key_entry.get()
+        folder_path = self.folder_path_var.get()
 
         if not api_key or not folder_path:
             messagebox.showerror("Error", "Please enter API key and select a folder.")
             return
 
-        self.update_status("Pre-checking files...", ":mag:")
+        self.client = OpenAI(api_key=api_key)
+        self.stop_event.clear()
+        self.transcribe_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+
+        # Clear previous progress displays
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        self.queued_files = []
+        self.processed_files = []
+        self.skipped_files = []
+
+        threading.Thread(target=self.process_files, args=(folder_path,), daemon=True).start()
+
+    def stop_transcription(self):
+        self.stop_event.set()
+        self.stop_button.config(state=tk.DISABLED)
+
+    def process_files(self, folder_path):
         mp3_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.mp3')]
-        total_files = len(mp3_files)
-        files_to_process = []
-
-        for i, file_name in enumerate(mp3_files, 1):
-            if self.stop_event.is_set():
-                return
-
-            file_path = os.path.join(folder_path, file_name)
-            transcript_path = self.get_transcript_path(file_path)
-            
-            if os.path.exists(transcript_path):
-                self.update_file_progress(file_name, "Skipped (exists)", 100)
-            else:
-                files_to_process.append(file_path)
-                self.update_file_progress(file_name, "Queued", 0)
-            
-            self.overall_progress_var.set(i / total_files * 50)  # Pre-check is 50% of overall progress
-
-        self.total_files = len(files_to_process)
+        self.total_files = len(mp3_files)
         self.completed_files = 0
-        self.update_status(f"Pre-check complete. Processing {self.total_files} files.", ":rocket:")
-        self.transcribe_files(api_key, files_to_process)
 
-    def transcribe_files(self, api_key, files_to_process):
-        client = OpenAI(api_key=api_key)
-
-        for i, file_path in enumerate(files_to_process, 1):
+        for file_name in mp3_files:
             if self.stop_event.is_set():
                 break
 
-            file_name = os.path.basename(file_path)
+            file_path = os.path.join(folder_path, file_name)
             file_size = os.path.getsize(file_path)
-            is_large_file = file_size > 25 * 1024 * 1024
 
-            if self.only_large_files.get() and not is_large_file:
-                self.update_file_progress(file_name, "Skipped (size)", 100)
-                self.completed_files += 1
-                continue
-
-            if is_large_file:
-                self.split_and_queue_file(file_path)
+            if file_size > 24 * 1024 * 1024:  # 24 MB
+                self.split_and_transcribe(file_path)
             else:
-                self.queue_file(file_path)
+                self.transcribe_file(self.client, file_path)
 
-        self.update_status("Processing queued files...", ":gear:")
-        threading.Thread(target=self.process_queue, args=(client,), daemon=True).start()
+        self.generate_report()
+        self.transcribe_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        messagebox.showinfo("Transcription Complete", f"Processed {self.completed_files} out of {self.total_files} files.")
 
-    def split_and_queue_file(self, file_path):
+    def split_and_transcribe(self, file_path):
         file_name = os.path.basename(file_path)
-        self.update_file_progress(file_name, "Splitting", 25)
-        
+        self.update_file_progress(file_name, "Splitting", 10)
+
         audio = AudioSegment.from_mp3(file_path)
-        mid_point = len(audio) // 2
-        part1 = audio[:mid_point]
-        part2 = audio[mid_point:]
+        duration_ms = len(audio)
+        chunk_size_ms = 12 * 60 * 1000  # 12 minutes in milliseconds
+        num_chunks = math.ceil(duration_ms / chunk_size_ms)
 
-        base_name = os.path.splitext(file_name)[0]
-        part1_name = f"{base_name}_part1.mp3"
-        part2_name = f"{base_name}_part2.mp3"
-        part1_path = os.path.join(os.path.dirname(file_path), part1_name)
-        part2_path = os.path.join(os.path.dirname(file_path), part2_name)
+        for i in range(num_chunks):
+            if self.stop_event.is_set():
+                break
 
-        self.update_file_progress(file_name, "Saving parts", 50)
-        part1.export(part1_path, format="mp3")
-        part2.export(part2_path, format="mp3")
+            start = i * chunk_size_ms
+            end = min((i + 1) * chunk_size_ms, duration_ms)
+            chunk = audio[start:end]
 
-        self.update_file_progress(file_name, "Processing parts", 75)
-        self.queue_file(part1_path, original_file=file_name)
-        self.queue_file(part2_path, original_file=file_name)
+            chunk_name = f"{os.path.splitext(file_name)[0]}_part{i+1}.mp3"
+            chunk_path = os.path.join(os.path.dirname(file_path), chunk_name)
+            chunk.export(chunk_path, format="mp3")
 
-    def queue_file(self, file_path, original_file=None):
-        file_name = os.path.basename(file_path)
-        self.transcription_queue.put((file_path, original_file))
-        self.update_file_progress(file_name, "Queued", 0)
+            self.transcribe_file(self.client, chunk_path, original_file=file_name)
 
-    def process_queue(self, client):
-        while not self.transcription_queue.empty() and not self.stop_event.is_set():
-            file_path, original_file = self.transcription_queue.get()
-            self.transcribe_file(client, file_path, original_file)
-        
-        self.update_overall_progress()
-        self.show_summary()
+        self.merge_transcripts(file_path, num_chunks)
 
     def transcribe_file(self, client, file_path, original_file=None):
         file_name = os.path.basename(file_path)
         try:
-            self.update_file_progress(file_name, "Uploading", 25)
-
+            self.update_file_progress(original_file or file_name, "Uploading", 25)
             with open(file_path, "rb") as audio_file:
-                self.update_file_progress(file_name, "Transcribing", 50)
+                self.update_file_progress(original_file or file_name, "Transcribing", 50)
+                
                 transcript = client.audio.transcriptions.create(
                     model="whisper-1",
-                    file=audio_file
+                    file=audio_file,
+                    response_format="srt"
                 )
-
-            self.update_file_progress(file_name, "Saving", 75)
-            transcript_path = self.get_transcript_path(file_path)
-            with open(transcript_path, "w", encoding="utf-8") as f:
-                f.write(transcript.text)
-
+                
+                self.update_file_progress(original_file or file_name, "Saving transcript", 75)
+                
+                # Save SRT file
+                if self.output_format_var.get() in ["srt", "both"]:
+                    srt_path = self.get_transcript_path(file_path, "srt")
+                    with open(srt_path, "w", encoding="utf-8") as f:
+                        f.write(self.add_metadata_to_srt(transcript, file_name))
+                
+                # Save text file
+                if self.output_format_var.get() in ["text", "both"]:
+                    text_path = self.get_transcript_path(file_path, "txt")
+                    with open(text_path, "w", encoding="utf-8") as f:
+                        f.write(self.clean_transcript(transcript, file_name))
+            
             if not original_file:
                 self.update_file_progress(file_name, "Completed", 100)
                 self.completed_files += 1
+                self.processed_files.append(file_name)
             else:
-                if original_file not in self.processed_parts:
-                    self.processed_parts[original_file] = 1
-                else:
-                    self.processed_parts[original_file] += 1
-                
-                if self.processed_parts[original_file] == 2:  # Both parts processed
-                    self.update_file_progress(original_file, "Completed", 100)
-                    self.completed_files += 1
-                else:
-                    self.update_file_progress(original_file, f"Part {self.processed_parts[original_file]}/2 done", 75 + (self.processed_parts[original_file] * 12.5))
+                self.update_file_progress(original_file, f"Processed part {file_name}", 75)
 
         except Exception as e:
-            self.update_file_progress(file_name, f"Failed: {str(e)}", 100)
-            if original_file:
-                self.update_file_progress(original_file, f"Failed: {str(e)}", 100)
+            error_message = str(e)
+            self.update_file_progress(original_file or file_name, f"Failed: {error_message}", 100)
+            self.skipped_files.append((original_file or file_name, error_message))
 
-    def get_transcript_path(self, file_path):
+    def merge_transcripts(self, original_file_path, num_chunks):
+        file_name = os.path.basename(original_file_path)
+        self.update_file_progress(file_name, "Merging transcripts", 90)
+
+        base_name = os.path.splitext(file_name)[0]
+        merged_srt = ""
+        merged_text = ""
+
+        for i in range(num_chunks):
+            chunk_name = f"{base_name}_part{i+1}.mp3"
+            chunk_path = os.path.join(os.path.dirname(original_file_path), chunk_name)
+
+            if self.output_format_var.get() in ["srt", "both"]:
+                srt_path = self.get_transcript_path(chunk_path, "srt")
+                with open(srt_path, "r", encoding="utf-8") as f:
+                    merged_srt += f.read() + "\n\n"
+                os.remove(srt_path)
+
+            if self.output_format_var.get() in ["text", "both"]:
+                text_path = self.get_transcript_path(chunk_path, "txt")
+                with open(text_path, "r", encoding="utf-8") as f:
+                    merged_text += f.read() + "\n\n"
+                os.remove(text_path)
+
+            os.remove(chunk_path)
+
+        if self.output_format_var.get() in ["srt", "both"]:
+            merged_srt_path = self.get_transcript_path(original_file_path, "srt")
+            with open(merged_srt_path, "w", encoding="utf-8") as f:
+                f.write(self.add_metadata_to_srt(merged_srt, file_name))
+
+        if self.output_format_var.get() in ["text", "both"]:
+            merged_text_path = self.get_transcript_path(original_file_path, "txt")
+            with open(merged_text_path, "w", encoding="utf-8") as f:
+                f.write(self.add_metadata_to_text(merged_text, file_name))
+
+        self.update_file_progress(file_name, "Completed", 100)
+        self.completed_files += 1
+        self.processed_files.append(file_name)
+
+    def get_transcript_path(self, file_path, extension):
         base_name = os.path.splitext(os.path.basename(file_path))[0]
-        return os.path.join(os.path.dirname(file_path), f"{base_name}_transcript.txt")
+        return os.path.join(os.path.dirname(file_path), f"{base_name}_transcript.{extension}")
 
-    def select_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.folder_path.set(folder)
+    def update_file_progress(self, file_name, status, progress):
+        if file_name not in self.file_progress:
+            frame = tk.Frame(self.scrollable_frame)
+            frame.pack(fill=tk.X, padx=5, pady=5)
 
-    def show_summary(self):
-        summary = f"Transcription complete.\n"
-        summary += f"Successfully transcribed: {self.completed_files}/{self.total_files}\n"
-        if self.completed_files < self.total_files:
-            failed = self.total_files - self.completed_files
-            summary += f"Failed: {failed}\n"
-        messagebox.showinfo("Transcription Summary", summary)
+            label = tk.Label(frame, text=file_name, width=40, anchor="w")
+            label.pack(side=tk.LEFT)
+
+            progress_bar = ttk.Progressbar(frame, length=200, mode='determinate')
+            progress_bar.pack(side=tk.LEFT, padx=5)
+
+            status_label = tk.Label(frame, text="", width=50, anchor="w")
+            status_label.pack(side=tk.LEFT)
+
+            self.file_progress[file_name] = {"frame": frame, "progress": progress_bar, "status": status_label}
+
+        self.file_progress[file_name]["progress"]["value"] = progress
+        self.file_progress[file_name]["status"].config(text=status)
+        self.update_overall_progress()
+
+    def update_overall_progress(self):
+        overall_progress = (self.completed_files / self.total_files) * 100
+        self.overall_progress["value"] = overall_progress
+        self.master.update_idletasks()
+
+    def clean_transcript(self, srt_content, file_name):
+        # Remove line numbers, timestamps, and empty lines
+        cleaned = re.sub(r'^\d+\n\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n', '', srt_content, flags=re.MULTILINE)
+        cleaned = re.sub(r'\n\s*\n', '\n', cleaned)
+        
+        # Join lines and remove extra whitespace
+        cleaned = ' '.join(cleaned.split())
+        
+        # Add proper spacing after punctuation
+        cleaned = re.sub(r'([.!?])(\S)', r'\1 \2', cleaned)
+        
+        # Split into paragraphs (every 5 sentences)
+        sentences = re.split(r'(?<=[.!?]) +', cleaned)
+        paragraphs = [' '.join(sentences[i:i+5]) for i in range(0, len(sentences), 5)]
+        
+        # Add metadata
+        return self.add_metadata_to_text('\n\n'.join(paragraphs), file_name)
+
+    def add_metadata_to_srt(self, srt_content, file_name):
+        recording_date = self.extract_date_from_filename(file_name)
+        total_duration = self.get_total_duration(srt_content)
+        
+        metadata = (f"File: {file_name}\n"
+                    f"Recording Date: {recording_date}\n"
+                    f"Duration: {total_duration}\n"
+                    f"Transcription Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        return metadata + srt_content
+
+    def add_metadata_to_text(self, text_content, file_name):
+        recording_date = self.extract_date_from_filename(file_name)
+        total_duration = self.get_total_duration_from_text(text_content)
+        
+        metadata = (f"File: {file_name}\n"
+                    f"Recording Date: {recording_date}\n"
+
+
+
+                    def add_metadata_to_text(self, text_content, file_name):
+        recording_date = self.extract_date_from_filename(file_name)
+        total_duration = self.get_total_duration_from_text(text_content)
+        
+        metadata = (f"File: {file_name}\n"
+                    f"Recording Date: {recording_date}\n"
+                    f"Duration: {total_duration}\n"
+                    f"Transcription Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        return metadata + text_content
+
+    def extract_date_from_filename(self, file_name):
+        date_match = re.search(r'(\d{6})_', file_name)
+        if date_match:
+            date_str = date_match.group(1)
+            return datetime.datetime.strptime(date_str, '%y%m%d').strftime('%Y-%m-%d')
+        return "Unknown"
+
+    def get_total_duration(self, srt_content):
+        last_timestamp = re.findall(r'\d{2}:\d{2}:\d{2},\d{3}', srt_content)[-1]
+        time_parts = last_timestamp.split(':')
+        hours, minutes, seconds = map(float, [time_parts[0], time_parts[1], time_parts[2].replace(',', '.')])
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        return f"{int(total_seconds // 3600):02d}:{int((total_seconds % 3600) // 60):02d}:{total_seconds % 60:05.2f}"
+
+    def get_total_duration_from_text(self, text_content):
+        # Assuming the duration is included in the metadata of the text file
+        duration_match = re.search(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})', text_content)
+        if duration_match:
+            return duration_match.group(1)
+        return "Unknown"
+
+    def generate_report(self):
+        report_filename = f"transcript_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path = os.path.join(self.folder_path_var.get(), report_filename)
+        
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            report_file.write(f"MASSY Transcription Report\n")
+            report_file.write(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            report_file.write(f"Total files processed: {self.total_files}\n")
+            report_file.write(f"Successfully transcribed: {len(self.processed_files)}\n")
+            report_file.write(f"Skipped files: {len(self.skipped_files)}\n\n")
+            
+            report_file.write("Processed Files:\n")
+            for file in self.processed_files:
+                report_file.write(f"- {file}\n")
+            
+            report_file.write("\nSkipped Files:\n")
+            for file, reason in self.skipped_files:
+                report_file.write(f"- {file}: {reason}\n")
+
+        messagebox.showinfo("Report Generated", f"Transcription report saved as {report_filename}")
 
 if __name__ == "__main__":
-    root = tk.Tk()
     app = TranscriptionApp(root)
     root.mainloop()
