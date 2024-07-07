@@ -8,6 +8,7 @@ from pydub import AudioSegment
 import math
 import datetime
 import re
+
 class TranscriptionApp:
     def __init__(self, master):
         self.master = master
@@ -300,15 +301,6 @@ class TranscriptionApp:
         
         metadata = (f"File: {file_name}\n"
                     f"Recording Date: {recording_date}\n"
-
-
-
-                    def add_metadata_to_text(self, text_content, file_name):
-        recording_date = self.extract_date_from_filename(file_name)
-        total_duration = self.get_total_duration_from_text(text_content)
-        
-        metadata = (f"File: {file_name}\n"
-                    f"Recording Date: {recording_date}\n"
                     f"Duration: {total_duration}\n"
                     f"Transcription Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
@@ -323,10 +315,7 @@ class TranscriptionApp:
 
     def get_total_duration(self, srt_content):
         last_timestamp = re.findall(r'\d{2}:\d{2}:\d{2},\d{3}', srt_content)[-1]
-        time_parts = last_timestamp.split(':')
-        hours, minutes, seconds = map(float, [time_parts[0], time_parts[1], time_parts[2].replace(',', '.')])
-        total_seconds = hours * 3600 + minutes * 60 + seconds
-        return f"{int(total_seconds // 3600):02d}:{int((total_seconds % 3600) // 60):02d}:{total_seconds % 60:05.2f}"
+        return last_timestamp.replace(',', '.')
 
     def get_total_duration_from_text(self, text_content):
         # Assuming the duration is included in the metadata of the text file
@@ -358,5 +347,6 @@ class TranscriptionApp:
         messagebox.showinfo("Report Generated", f"Transcription report saved as {report_filename}")
 
 if __name__ == "__main__":
+    root = tk.Tk()
     app = TranscriptionApp(root)
     root.mainloop()
