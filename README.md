@@ -1,4 +1,5 @@
 # 🎙️ MASSY - MP3 to Text Transcription Application 📝
+![python_rWYcWc6Ccv](https://github.com/taskmasterpeace/Massey/assets/47542160/b4b56d5f-f4c7-4898-a9b5-7146ec533236)
 
 ## 🌟 Overview
 
